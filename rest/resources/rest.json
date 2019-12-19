@@ -1,6 +1,6 @@
 {
   "network": {
-    "name": "mijinTest",
+    "name": "publicTest",
     "description": "catapult development network"
   },
 
@@ -9,7 +9,7 @@
     "allowedHosts": ["*"],
     "allowedMethods": ["GET", "POST", "PUT", "OPTIONS"]
   },
-  "clientPrivateKey": "0000000000000000000000000000000000000000000000000000000000000000",
+  "clientPrivateKey": "120BBFBC8CB86A81260162BC99588955CCD942317EEA8EBD5CD91905FA0FA7A8",
   "extensions": [
     "accountLink",
     "aggregate",
@@ -23,37 +23,34 @@
     "restrictions",
     "transfer"
   ],
-
   "db": {
-    "url": "mongodb://localhost:27017/",
+    "url": "mongodb://db:27017/",
     "name": "catapult",
     "pageSizeMin": 10,
     "pageSizeMax": 100,
+    "countRangeMin": 1,
+    "countRangeMax": 100,
+    "countRangePreset": 25,
     "maxConnectionAttempts": 5,
     "baseRetryDelay": 500
   },
 
   "apiNode": {
-    "host": "127.0.0.1",
+    "host": "api-node-0",
     "port": 7900,
-    "publicKey": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "publicKey": "097B899EC24B4E925C1E3184F4946EA6363DE510578E2BBE0F9E4BA51A20F7F2",
     "timeout": 1000
   },
 
   "websocket": {
     "mq": {
-      "host": "127.0.0.1",
+      "host": "api-node-broker-0",
       "port": 7902,
       "monitorInterval": 500,
       "connectTimeout": 10000,
       "monitorLoggingThrottle": 60000
     },
     "allowOptionalAddress": true
-  },
-
-  "throttling": {
-    "burst": 20,
-    "rate": 5
   },
 
   "logging": {

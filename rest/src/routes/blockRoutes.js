@@ -19,6 +19,7 @@
  */
 
 const dbFacade = require('./dbFacade');
+const dbUtils = require('../db/dbUtils');
 const routeResultTypes = require('./routeResultTypes');
 const routeUtils = require('./routeUtils');
 const errors = require('../server/errors');
@@ -40,8 +41,10 @@ const getSanitizedLimit = (pageSize, limit) => {
 
 module.exports = {
 	register: (server, db, services) => {
+		const countRange = services.config.countRange;
+
 		server.get('/block/:height', (req, res, next) => {
-			const height = parseHeight(req.params);
+			const height = routeUtils.parseArgument(req.params, 'height', 'uint');
 
 			return dbFacade.runHeightDependentOperation(db, height, () => db.blockAtHeight(height))
 				.then(result => result.payload)
@@ -54,7 +57,7 @@ module.exports = {
 		);
 
 		server.get('/block/:height/transactions', (req, res, next) => {
-			const height = parseHeight(req.params);
+			const height = routeUtils.parseArgument(req.params, 'height', 'uint');
 			const pagingOptions = routeUtils.parsePagingArguments(req.params);
 
 			const operation = () => db.transactionsAtHeight(height, pagingOptions.id, pagingOptions.pageSize);
@@ -108,6 +111,37 @@ module.exports = {
 					res.send(buildResponse(packet, stateTreesCodec, routeResultTypes.stateTree));
 					next();
 				});
+		});
+
+		// CURSORS
+
+		// Gets blocks up to the height (non-inclusive).
+		//
+		// The duration may be:
+		//	- from
+		//	- since
+		//
+		// The block may be:
+		//	- latest (returning from the latest block).
+		//	- earliest (returning from the earliest block, IE, nothing).
+		//	- A block hash.
+		//	- A block height (as a number).
+		server.get('/blocks/:duration/:block/limit/:limit', (request, response, next) => {
+			const params = request.params;
+			const duration = routeUtils.parseArgument(params, 'duration', 'duration');
+
+			return routeUtils.getBlockTimeline({
+				request,
+				response,
+				next,
+				countRange,
+				timeline: db.blockTimeline,
+				collectionName: 'blocks',
+				redirectUrl: limit => `/blocks/${duration}/${params.block}/limit/${limit}`,
+				duration: duration,
+				transformer: info => info,
+				resultType: routeResultTypes.block
+			});
 		});
 	}
 };
