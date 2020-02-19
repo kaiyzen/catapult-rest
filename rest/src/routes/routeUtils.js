@@ -22,7 +22,9 @@ const dbFacade = require('./dbFacade');
 const routeResultTypes = require('./routeResultTypes');
 const errors = require('../server/errors');
 const catapult = require('catapult-sdk');
+const MongoDb = require('mongodb');
 
+const { Long } = MongoDb;
 const { address } = catapult.model;
 const { buildAuditPath, indexOfLeafWithHash } = catapult.crypto.merkle;
 const { convert, uint64 } = catapult.utils;
@@ -31,12 +33,53 @@ const constants = {
 	sizes: {
 		hexPublicKey: 64,
 		addressEncoded: 39,
+		addressEncoded: 40,
+		hexAddress: 50,
+		hexHash256: 64,
 		hash256: 32,
-		hash512: 64
+		hexHash512: 128,
+		hash512: 64,
+		hexObjectId: 24,
+		hexNamespaceId: 16,
+		hexMosaicId: 16
 	}
 };
 
 const isObjectId = str => 24 === str.length && convert.isHexString(str);
+
+/**
+ * Parses a decimal string into a uint64.
+ * @param {string} input A decimal encoded string.
+ * @returns {module:utils/uint64~uint64} Uint64 representation of the input.
+ */
+const uint64FromString = input => {
+	const long = Long.fromString(input);
+  const low = long.getLowBitsUnsigned();
+  let high = long.getHighBits();
+  if (high < 0) {
+      // Signed 32-bit integer, convert to unsigned.
+      high += 2**32;
+  }
+
+  return [low, high];
+};
+
+const namedValidatorMap = {
+	objectId: str => constants.sizes.hexObjectId === str.length && convert.isHexString(str),
+	namespaceId: str => constants.sizes.hexNamespaceId === str.length && convert.isHexString(str),
+	mosaicId: str => constants.sizes.hexMosaicId === str.length && convert.isHexString(str),
+	integer: str => /^\d+$/.test(str),
+	address: str => constants.sizes.addressEncoded === str.length || constants.sizes.hexAddress === str.length,
+	publicKey: str => constants.sizes.hexPublicKey === str.length,
+	hash256: str => constants.sizes.hexHash256 === str.length,
+	hash512: str => constants.sizes.hexHash512 === str.length,
+	earliest: str => str === 'earliest' || str === 'min',
+	latest: str => str === 'latest' || str === 'max',
+	least: str => str === 'least' || str === 'min',
+	most: str => str === 'most' || str === 'max',
+	duration: str => str === 'from' || str === 'since',
+	transferFilterType: str => str === 'mosaic' || str === 'multisig'
+};
 
 const namedParserMap = {
 	objectId: str => {
@@ -44,6 +87,18 @@ const namedParserMap = {
 			throw Error('must be 12-byte hex string');
 
 		return str;
+	},
+	namespaceId: str => {
+		if (!namedValidatorMap.namespaceId(str))
+			throw Error('must be 8-byte hex string');
+
+		return uint64.fromHex(str);
+	},
+	mosaicId: str => {
+		if (!namedValidatorMap.mosaicId(str))
+			throw Error('must be 8-byte hex string');
+
+		return uint64.fromHex(str);
 	},
 	uint: str => {
 		const result = convert.tryParseUint(str);
@@ -54,9 +109,14 @@ const namedParserMap = {
 	},
 	uint64: str => uint64.fromString(str),
 	uint64hex: str => uint64.fromHex(str),
+	uint64: str => {
+		return uint64FromString(str);
+	},
 	address: str => {
 		if (constants.sizes.addressEncoded === str.length)
 			return address.stringToAddress(str);
+		if (constants.sizes.hexAddress === str.length)
+			return convert.hexToUint8(str);
 
 		throw Error(`invalid length of address '${str.length}'`);
 	},
@@ -91,6 +151,24 @@ const namedParserMap = {
 			throw Error('must be boolean value \'true\' or \'false\'');
 
 		return 'true' === str;
+    },
+	duration: str => {
+		if (!namedValidatorMap.duration(str))
+			throw Error('invalid duration specifier');
+
+		return str;
+	},
+	transactionType: str => {
+		const type = catapult.model.EntityType[str];
+		if (undefined === type)
+			throw Error('unrecognized transaction type');
+
+		return type;
+	},
+	transferFilterType: str => {
+		if (namedValidatorMap.transferFilterType(str))
+			return str;
+		throw Error(`invalid transfer filter type ${str}`)
 	}
 };
 
@@ -114,6 +192,58 @@ const routeUtils = {
 		} catch (err) {
 			throw errors.createInvalidArgumentError(`${key} has an invalid format`, err);
 		}
+	},
+
+	/**
+	 * Parses a range argument and throws an invalid argument error if it is invalid.
+	 * @param {object} args Container containing the argument to parse.
+	 * @param {string} key Name of the argument to parse.
+	 * @param {object} range Range of valid values.
+	 * @param {Function|string} parser Parser to use or the name of a named parser.
+	 * @returns {object} Parsed value.
+	 */
+	parseRangeArgument(args, key, range, parser) {
+		try {
+			return this.parseRangeValue(args[key], range, parser);
+		} catch (err) {
+			throw errors.createInvalidArgumentError(`${key} has an invalid format`, err);
+		}
+	},
+
+	/**
+	 * Parses a value.
+	 * @param {any} str Value to parse.
+	 * @param {Function|string} parser Parser to use or the name of a named parser.
+	 * @returns {object} Parsed value.
+	 */
+	parseValue: (str, parser) => {
+		return ('string' === typeof parser ? namedParserMap[parser] : parser)(str);
+	},
+
+	/**
+	 * Parses a value with valid, acceptable range values.
+	 * @param {any} str Value to parse.
+	 * @param {object} range Range of valid values.
+	 * @param {Function|string} parser Parser to use or the name of a named parser.
+	 * @returns {object} Parsed value or undefined.
+	 */
+	parseRangeValue(str, range, parser) {
+		const value = this.parseValue(str, parser);
+		if (value < range.min)
+			return undefined;
+		if (value > range.max)
+			return undefined;
+		return value;
+	},
+
+	/**
+	 * Validates a value to parse.
+	 * @param {any} value Value to validate.
+	 * @param {Function|string} validator Validator to use or the name of a named validator.
+	 * @returns {object} Whether value is valid.
+	 */
+	validateValue: (value, validator) => {
+		return ('string' === typeof validator ? namedValidatorMap[validator] : validator)(value);
 	},
 
 	/**
@@ -271,6 +401,448 @@ const routeUtils = {
 			};
 		}
 	}),
+
+	/**
+	 * Query and send duration collection to network.
+	 *
+	 *	@param {object} info Information to create and send query.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} identifier Identifier for query for error handling.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} method Name of timeline method to call.
+	 *		@field {array} args Arguments to timeline method.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	queryAndSendTimeline: info => {
+		info.timeline[info.method](...info.args)
+			.then(data => {
+				if (data === undefined) {
+					info.response.send(errors.createNotFoundError(info.identifier));
+					return info.next();
+				}
+
+				info.response.send({
+					payload: data.map(info.transformer),
+					type: info.resultType
+				});
+				info.next();
+			});
+	},
+
+	/**
+	 *	Method to get account timelines from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getAccountTimeline(info) {
+		const params = info.request.params;
+		const account = params.account;
+		const limit = routeUtils.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (routeUtils.validateValue(account, 'least')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, limit];
+		} else if (routeUtils.validateValue(account, 'most')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, limit];
+		} else if (routeUtils.validateValue(account, 'address')) {
+			method = info.duration + 'Address';
+			const address = routeUtils.parseValue(account, 'address');
+			args = [info.collectionName, address, limit];
+		} else if (routeUtils.validateValue(account, 'publicKey')) {
+			method = info.duration + 'PublicKey';
+			const publicKey = routeUtils.parseValue(account, 'publicKey');
+			args = [info.collectionName, publicKey, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('accountId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: account,
+			method,
+			args
+		});
+	},
+
+	/**
+	 *	Method to get block timelines from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getBlockTimeline(info) {
+		const params = info.request.params;
+		const block = params.block;
+		const limit = this.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (this.validateValue(block, 'earliest')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(block, 'latest')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(block, 'hash256')) {
+			method = info.duration + 'Hash';
+			const hash = this.parseValue(block, 'hash256');
+			args = [info.collectionName, hash, limit];
+		} else if (this.validateValue(block, 'integer')) {
+			method = info.duration + 'Height';
+			const height = this.parseValue(block, 'uint64');
+			args = [info.collectionName, height, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('blockId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: block,
+			method,
+			args
+		});
+	},
+
+	/**
+	 *	Method to get mosaic timelines from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getMosaicTimeline(info) {
+		const params = info.request.params;
+		const mosaic = params.mosaic;
+		const limit = this.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (this.validateValue(mosaic, 'earliest')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(mosaic, 'latest')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(mosaic, 'mosaicId')) {
+			method = info.duration + 'Id';
+			const id = this.parseValue(mosaic, 'mosaicId');
+			args = [info.collectionName, id, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('mosaicId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: mosaic,
+			method,
+			args
+		});
+	},
+
+	/**
+	 *	Method to get namespace timelines from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getNamespaceTimeline(info) {
+		const params = info.request.params;
+		const namespace = params.namespace;
+		const limit = this.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (this.validateValue(namespace, 'earliest')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(namespace, 'latest')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(namespace, 'namespaceId')) {
+			method = info.duration + 'Id';
+			const id = this.parseValue(namespace, 'namespaceId');
+			args = [info.collectionName, id, limit];
+	  } else if (this.validateValue(namespace, 'objectId')) {
+			method = info.duration + 'ObjectId';
+			const id = this.parseValue(namespace, 'objectId');
+			args = [info.collectionName, id, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('namespaceId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: namespace,
+			method,
+			args
+		});
+	},
+
+	/**
+	 *	Method to get transaction timelines from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getTransactionTimeline(info) {
+		const params = info.request.params;
+		const transaction = params.transaction;
+		const limit = this.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (this.validateValue(transaction, 'earliest')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(transaction, 'latest')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, limit];
+		} else if (this.validateValue(transaction, 'objectId')) {
+			method = info.duration + 'Id';
+			const id = this.parseValue(transaction, 'objectId');
+			args = [info.collectionName, id, limit];
+		} else if (this.validateValue(transaction, 'hash256')) {
+			method = info.duration + 'Hash';
+			const hash = this.parseValue(transaction, 'hash256');
+			args = [info.collectionName, hash, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('transactionId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: transaction,
+			method,
+			args
+		});
+	},
+
+	/**
+	 *	Method to get transaction timelines filtered by type from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getTransactionByTypeTimeline(info) {
+		const params = info.request.params;
+		const transaction = params.transaction;
+		const limit = this.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+		const type = this.parseArgument(params, 'type', 'transactionType');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (this.validateValue(transaction, 'earliest')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, type, limit];
+		} else if (this.validateValue(transaction, 'latest')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, type, limit];
+		} else if (this.validateValue(transaction, 'objectId')) {
+			method = info.duration + 'Id';
+			const id = this.parseValue(transaction, 'objectId');
+			args = [info.collectionName, id, type, limit];
+		} else if (this.validateValue(transaction, 'hash256')) {
+			method = info.duration + 'Hash';
+			const hash = this.parseValue(transaction, 'hash256');
+			args = [info.collectionName, hash, type, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('transactionId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: transaction,
+			method,
+			args
+		});
+	},
+
+	/**
+	 *	Method to get transaction timelines filtered by type and a subfilter from a duration and argument.
+	 *
+	 *	@param {object} info Information to fetch timeline from database.
+	 *		@field {object} request Restify request object.
+	 *		@field {object} response Restify response object.
+	 *		@field {Function} next Restify next callback handler.
+	 *		@field {object} timeline Timeline utility.
+	 *		@field {string} collectionName Name of the collection to query.
+	 *		@field {object} countRange Range of valid query counts.
+	 *		@field {Function} redirectUrl Callback to get redirect URL.
+	 *		@field {string} duration Duration specifier: 'from' or 'since'.
+	 *		@field {Function} transformer Callback to transform returned data prior to sending.
+	 *		@field {string} resultType Response data type.
+	 */
+	getTransactionByTypeWithFilterTimeline(info) {
+		const params = info.request.params;
+		const transaction = params.transaction;
+		const limit = this.parseRangeArgument(params, 'limit', info.countRange, 'uint');
+		const type = this.parseArgument(params, 'type', 'transactionType');
+		// params.type has already been white-listed, so this is safe.
+		const filter = this.parseArgument(params, 'filter', params.type + 'FilterType');
+
+		if (!limit) {
+			const url = info.redirectUrl(info.countRange.preset);
+			return info.response.redirect(url, info.next);
+		}
+
+		let method;
+		let args;
+		if (this.validateValue(transaction, 'earliest')) {
+			method = info.duration + 'Min';
+			args = [info.collectionName, type, filter, limit];
+		} else if (this.validateValue(transaction, 'latest')) {
+			method = info.duration + 'Max';
+			args = [info.collectionName, type, filter, limit];
+		} else if (this.validateValue(transaction, 'objectId')) {
+			method = info.duration + 'Id';
+			const id = this.parseValue(transaction, 'objectId');
+			args = [info.collectionName, id, type, filter, limit];
+		} else if (this.validateValue(transaction, 'hash256')) {
+			method = info.duration + 'Hash';
+			const hash = this.parseValue(transaction, 'hash256');
+			args = [info.collectionName, hash, type, filter, limit];
+		} else {
+			const error = errors.createInvalidArgumentError('transactionId has an invalid format');
+			info.response.send(error);
+			return info.next();
+		}
+
+		this.queryAndSendTimeline({
+			response: info.response,
+			next: info.next,
+			timeline: info.timeline,
+			transformer: info.transformer,
+			resultType: info.resultType,
+			identifier: transaction,
+			method,
+			args
+		});
+	},
 
 	/**
 	 * Adds GET and POST routes for looking up documents of a single type.

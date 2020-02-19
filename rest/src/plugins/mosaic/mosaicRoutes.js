@@ -25,6 +25,7 @@ const { uint64 } = catapult.utils;
 
 module.exports = {
 	register: (server, db, services) => {
+        const countRange = services.config.countRange;
 		const mosaicSender = routeUtils.createSender('mosaicDescriptor');
 
 		server.get('/mosaics', (req, res, next) => {
@@ -43,5 +44,56 @@ module.exports = {
 			params => db.mosaicsByIds(params),
 			uint64.fromHex
 		);
+
+		const ownedMosaicsSender = routeUtils.createSender('ownedMosaics');
+
+		server.get('/account/:accountId/mosaics', (req, res, next) => {
+			const [type, accountId] = routeUtils.parseArgument(req.params, 'accountId', 'accountId');
+
+			return db.mosaicsByOwners(type, [accountId])
+				.then(mosaics => ownedMosaicsSender.sendOne('accountId', res, next)({ mosaics }));
+		});
+
+		server.post('/account/mosaics', (req, res, next) => {
+			if (req.params.publicKeys && req.params.addresses)
+				throw errors.createInvalidArgumentError('publicKeys and addresses cannot both be provided');
+
+			const idOptions = Array.isArray(req.params.publicKeys)
+				? { keyName: 'publicKeys', parserName: 'publicKey', type: AccountType.publicKey }
+				: { keyName: 'addresses', parserName: 'address', type: AccountType.address };
+
+			const accountIds = routeUtils.parseArgumentAsArray(req.params, idOptions.keyName, idOptions.parserName);
+			return db.mosaicsByOwners(idOptions.type, accountIds)
+				.then(mosaics => ownedMosaicsSender.sendOne(idOptions.keyName, res, next)({ mosaics }));
+		});
+
+		// CURSOR
+
+		// Gets mosaic up to the identifier (non-inclusive).
+		//
+		// The duration may be:
+		//	- from
+		//	- since
+		//
+		// The identifier may be:
+		//	- latest (returning up-to and including the latest mosaic).
+		//	- earliest (returning from the earliest mosaic, IE, nothing).
+		//	- A mosaic ID.
+		server.get('/mosaics/:duration/:mosaic/limit/:limit', (request, response, next) => {
+			const params = request.params;
+			const duration = routeUtils.parseArgument(params, 'duration', 'duration');
+			return routeUtils.getMosaicTimeline({
+				request,
+				response,
+				next,
+				countRange,
+				timeline: db.mosaicTimeline,
+				collectionName: 'mosaics',
+				redirectUrl: limit => `/mosaics/${duration}/${params.mosaic}/limit/${limit}`,
+				duration: duration,
+				transformer: info => info,
+				resultType: 'mosaicDescriptor'
+			});
+		});
 	}
 };

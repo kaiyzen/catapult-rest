@@ -127,6 +127,11 @@ const registerRoutes = (server, db, services) => {
 				max: services.config.db.pageSizeMax || 100,
 				default: services.config.db.pageSizeDefault || 20
 			},
+			countRange: {
+				min: services.config.db.countRangeMin,
+				max: services.config.db.countRangeMax,
+				preset: services.config.db.countRangePreset,
+			},
 			apiNode: services.config.apiNode,
 			websocket: services.config.websocket,
 			numBlocksTransactionFeeStats: services.config.numBlocksTransactionFeeStats

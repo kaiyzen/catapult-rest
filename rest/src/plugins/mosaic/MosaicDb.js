@@ -18,6 +18,8 @@
  * along with Catapult.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+const AccountType = require('../AccountType');
+const Timeline = require('../../db/Timeline');
 const MongoDb = require('mongodb');
 
 const { Long } = MongoDb;
@@ -30,6 +32,58 @@ class MosaicDb {
 	 */
 	constructor(db) {
 		this.catapultDb = db;
+
+    // Mosaic timeline.
+    const mosaicMinArgs = () => [Timeline.minLong(), Timeline.minObjectId()];
+    const mosaicMaxArgs = () => [Timeline.maxLong(), Timeline.maxObjectId()];
+    const mosaicToArgs = (mosaic) => [mosaic.mosaic.startHeight, mosaic._id];
+    this.mosaicTimeline = new Timeline({
+      database: this,
+      ...Timeline.generateAbsoluteParameters({
+        baseMethodName: 'mosaics',
+        generateMinArgs: mosaicMinArgs,
+        generateMaxArgs: mosaicMaxArgs
+      }),
+      ...Timeline.generateIdParameters({
+        keyName: 'Id',
+        baseMethodName: 'mosaics',
+        idMethodName: 'rawMosaicById',
+        generateArgs: mosaicToArgs
+      })
+    });
+	}
+
+  // region raw mosaic retrieval
+
+  // Internal method: retrieve mosaic by ID.
+  // Does not process internal _id.
+  rawMosaicById(collectionName, id) {
+    const mosaicId = new Long(id[0], id[1]);
+    const condition = { 'mosaic.id': { $eq: mosaicId } };
+    return this.catapultDb.queryDocument(collectionName, condition);
+  }
+
+  // endregion
+
+  // region cursor mosaic retrieval
+
+	// Internal method to find sorted mosaics from query.
+  // Note:
+  //  Use an initial sort to ensure we limit in the desired order,
+  //  then use a final sort to ensure everything is in descending order.
+	sortedMosaics(collectionName, condition, sortAscending, count) {
+		// Sort by descending startHeight, then by descending ID.
+		// Don't sort solely on ID, since it will break if 32-bit time wraps.
+    const order = sortAscending ? 1 : -1;
+    const initialSort = { 'mosaic.startHeight': order, _id: order };
+		const finalSort = { 'mosaic.startHeight': -1, _id: -1 };
+    return this.catapultDb.database.collection(collectionName)
+      .find(condition)
+      .sort(initialSort)
+      .limit(count)
+      .sort(finalSort)
+      .toArray()
+			.then(this.catapultDb.sanitizer.deleteIds);
 	}
 
 	/**
@@ -53,6 +107,34 @@ class MosaicDb {
 		const sortConditions = { $sort: { [sortingOptions[options.sortField]]: options.sortDirection } };
 		return this.catapultDb.queryPagedDocuments_2(conditions, [], sortConditions, 'mosaics', options);
 	}
+
+	// Internal method to get mosaics up to (non-inclusive) the block height
+	// and the mosaic ID, returning at max `count` items.
+	mosaicsFrom(collectionName, height, id, count) {
+		const condition = { $or: [
+			{ 'mosaic.startHeight': { $eq: height }, _id: { $lt: id } },
+			{ 'mosaic.startHeight': { $lt: height } }
+		]};
+
+		return this.sortedMosaics(collectionName, condition, false, count)
+			.then(mosaics => Promise.resolve(mosaics));
+	}
+
+	// Internal method to get mosaics since (non-inclusive) the block height
+	// and the mosaic ID, returning at max `count` items.
+	mosaicsSince(collectionName, height, id, count) {
+		const condition = { $or: [
+			{ 'mosaic.startHeight': { $eq: height }, _id: { $gt: id } },
+			{ 'mosaic.startHeight': { $gt: height } }
+		]};
+
+		return this.sortedMosaics(collectionName, condition, true, count)
+			.then(mosaics => Promise.resolve(mosaics));
+	}
+
+  // endregion
+
+  // region mosaic retrieval
 
 	/**
 	 * Retrieves mosaics given their ids.
