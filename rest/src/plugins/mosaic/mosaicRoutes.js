@@ -26,7 +26,8 @@ const catapult = require('catapult-sdk');
 const { uint64 } = catapult.utils;
 
 module.exports = {
-	register: (server, db) => {
+	register: (server, db, services) => {
+    const countRange = services.config.countRange;
 		const mosaicSender = routeUtils.createSender('mosaicDescriptor');
 
 		routeUtils.addGetPostDocumentRoutes(
@@ -57,6 +58,35 @@ module.exports = {
 			const accountIds = routeUtils.parseArgumentAsArray(req.params, idOptions.keyName, idOptions.parserName);
 			return db.mosaicsByOwners(idOptions.type, accountIds)
 				.then(mosaics => ownedMosaicsSender.sendOne(idOptions.keyName, res, next)({ mosaics }));
+		});
+
+		// CURSOR
+
+		// Gets mosaic up to the identifier (non-inclusive).
+		//
+		// The duration may be:
+		//	- from
+		//	- since
+		//
+		// The identifier may be:
+		//	- latest (returning up-to and including the latest mosaic).
+		//	- earliest (returning from the earliest mosaic, IE, nothing).
+		//	- A mosaic ID.
+		server.get('/mosaics/:duration/:mosaic/limit/:limit', (request, response, next) => {
+			const params = request.params;
+			const duration = routeUtils.parseArgument(params, 'duration', 'duration');
+			return routeUtils.getMosaicTimeline({
+				request,
+				response,
+				next,
+				countRange,
+				timeline: db.mosaicTimeline,
+				collectionName: 'mosaics',
+				redirectUrl: limit => `/mosaics/${duration}/${params.mosaic}/limit/${limit}`,
+				duration: duration,
+				transformer: info => info,
+				resultType: 'mosaicDescriptor'
+			});
 		});
 	}
 };
