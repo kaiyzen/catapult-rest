@@ -180,7 +180,7 @@ class ModelSchemaBuilder {
 				tree: { type: ModelType.array, schemaName: ModelType.binary }
 			},
 			storageInfo: {
-			}
+			},
 
 			// endregion
 		};
