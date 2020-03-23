@@ -28,7 +28,6 @@ const { address, networkInfo } = catapult.model;
 
 module.exports = {
 	register: (server, db, services) => {
-		const countRange = services.config.countRange;
 		const transactionSender = routeUtils.createSender(routeResultTypes.transaction);
 
 		const accountIdToPublicKey = (type, accountId) => {
@@ -126,7 +125,7 @@ module.exports = {
 		});
 
 		// endregion
-
+		
 		// CURSORS - ACCOUNTS BY IMPORTANCE
 
 		// Gets accounts by importance up to the identifier (non-inclusive).
