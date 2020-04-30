@@ -19,7 +19,6 @@
  */
 
 const dbFacade = require('./dbFacade');
-const dbUtils = require('../db/dbUtils');
 const routeResultTypes = require('./routeResultTypes');
 const routeUtils = require('./routeUtils');
 const errors = require('../server/errors');
@@ -44,7 +43,7 @@ module.exports = {
 		const countRange = services.config.countRange;
 
 		server.get('/block/:height', (req, res, next) => {
-			const height = routeUtils.parseArgument(req.params, 'height', 'uint');
+			const height = parseHeight(req.params);
 
 			return dbFacade.runHeightDependentOperation(db, height, () => db.blockAtHeight(height))
 				.then(result => result.payload)
