@@ -25,6 +25,20 @@ const catapult = require('catapult-sdk');
 const { convert } = catapult.utils;
 const { PacketType } = catapult.packet;
 
+const constants = {
+	sizes: {
+		hash: 64,
+		objectId: 24
+	}
+};
+
+const parseObjectId = str => {
+	if (!convert.isHexString(str))
+		throw Error('must be 12-byte hex string');
+
+	return str;
+};
+
 module.exports = {
 	register: (server, db, services) => {
 		const countRange = services.config.countRange;
