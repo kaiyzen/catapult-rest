@@ -37,6 +37,13 @@ const constants = {
 
 const isValidTransactionGroup = group => ['confirmed', 'unconfirmed', 'partial'].includes(group);
 
+const parseObjectId = str => {
+	if (!convert.isHexString(str))
+		throw Error('must be 12-byte hex string');
+
+	return str;
+};
+
 module.exports = {
 	register: (server, db, services) => {
 		const sender = routeUtils.createSender(routeResultTypes.transaction);
