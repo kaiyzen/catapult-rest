@@ -25,11 +25,45 @@ const { convertToLong } = require('./dbUtils');
 const catapult = require('catapult-sdk');
 const MongoDb = require('mongodb');
 
-const { EntityType } = catapult.model;
-const { ObjectId } = MongoDb;
+const { address, EntityType } = catapult.model;
+const { Long, ObjectId } = MongoDb;
 
 const isAggregateType = document => EntityType.aggregateComplete === document.transaction.type
 	|| EntityType.aggregateBonded === document.transaction.type;
+
+const extractAggregateIds = transactions => {
+	const aggregateIds = [];
+	const transactionMap = {};
+	transactions
+		.filter(isAggregateType)
+		.forEach(info => {
+			const aggregateId = info.meta.id;
+			aggregateIds.push(aggregateId);
+			transactionMap[aggregateId.toString()] = info.transaction;
+		});
+
+	return { aggregateIds, transactionMap };
+}
+
+const addAggregateTransaction = (transactionMap, aggregateTransaction) => {
+	const transaction = transactionMap[aggregateTransaction.meta.aggregateId];
+	if (!transaction.transactions)
+		transaction.transactions = [];
+
+	transaction.transactions.push(aggregateTransaction);
+}
+
+const createAccountTransactionsAllConditions = (publicKey, networkId) => {
+	const decodedAddress = address.publicKeyToAddress(publicKey, networkId);
+	const bufferPublicKey = Buffer.from(publicKey);
+	const bufferAddress = Buffer.from(decodedAddress);
+	return {
+		$or: [
+			{ 'transaction.cosignatures.signerPublicKey': bufferPublicKey },
+			{ 'meta.addresses': bufferAddress }
+		]
+	};
+};
 
 const createSanitizer = () => ({
 	copyAndDeleteId: dbObject => {
@@ -82,6 +116,12 @@ const createSanitizer = () => ({
 	}
 });
 
+const createMetaAddressesConditions = accountAddress => ({ 'meta.addresses': Buffer.from(accountAddress) });
+
+const createMetaAddressesAndTypeConditions = (accountAddress, transactionTypes) => (
+	{ $and: [createMetaAddressesConditions(accountAddress), { 'transaction.type': { $in: transactionTypes } }] }
+);
+
 const mapToPromise = dbObject => Promise.resolve(null === dbObject ? undefined : dbObject);
 
 const buildBlocksFromOptions = (height, numBlocks, chainHeight) => {
@@ -96,8 +136,55 @@ const buildBlocksFromOptions = (height, numBlocks, chainHeight) => {
 	return { startHeight, endHeight, numBlocks: endHeight.subtract(startHeight).toNumber() };
 };
 
+const boundPageSize = (pageSize, bounds) => Math.max(bounds.pageSizeMin, Math.min(bounds.pageSizeMax, pageSize));
+
 const getBoundedPageSize = (pageSize, pagingOptions) =>
 	Math.max(pagingOptions.pageSizeMin, Math.min(pagingOptions.pageSizeMax, pageSize || pagingOptions.pageSizeDefault));
+// Calculate the start and end block height from the provided from height.
+const calculateFromHeight = (height, chainHeight, numBlocks) => {
+	const one = convertToLong(1);
+	const count = convertToLong(numBlocks);
+	// We want the numBlocks preceding the height, non-inclusive.
+	// If we've provided a number above the blockHeight, go to
+	// chainHeight + 1.
+	const endHeight = height.greaterThan(chainHeight) ? chainHeight.add(one) : height;
+	const startHeight = endHeight.greaterThan(count) ? endHeight.subtract(count) : one;
+	return { startHeight, endHeight };
+}
+
+// Calculate the start and end block height from the provided since height.
+const calculateSinceHeight = (height, chainHeight, numBlocks) => {
+	const one = convertToLong(1);
+	const count = convertToLong(numBlocks);
+	// We want the numBlocks following the height, non-inclusive.
+	// If we've provided a number above the blockHeight, go to
+	// chainHeight + 1 for the start (returns nothing, even if a block is added).
+	const startHeight = height.greaterThan(chainHeight) ? chainHeight.add(one) : height;
+	const endHeight = startHeight.add(count);
+	return { startHeight, endHeight };
+}
+
+// Implied method to add the importance field.
+// Calculates if importances is empty, if so, returns Long(0), otherwise,
+// extracts the field from the struct.
+const addFieldImportanceImpl = (field) => {
+	return {
+		$cond: {
+			if: { $gt: [ { $size: "$account.importances" }, 0 ] },
+			then: {
+				$let: {
+					vars: {
+						lastImportance: { $arrayElemAt: [ "$account.importances", -1 ] }
+					},
+					in: `$$lastImportance.${field}`
+				}
+			},
+			else: { $toLong: 0 }
+		}
+	};
+}
+
+// DATABASE
 
 const TransactionGroup = Object.freeze({
 	confirmed: 'transactions',
@@ -113,12 +200,85 @@ class CatapultDb {
 		if (!this.networkId)
 			throw Error('network id is required');
 
+		this.pageSizeMin = options.pageSizeMin || 10;
+		this.pageSizeMax = options.pageSizeMax || 100;
+
 		this.pagingOptions = {
 			pageSizeMin: options.pageSizeMin,
 			pageSizeMax: options.pageSizeMax,
 			pageSizeDefault: options.pageSizeDefault
 		};
 		this.sanitizer = createSanitizer();
+		// Accounts by importance timeline.
+		const accountMinArgs = () => [Timeline.minLong(), Timeline.minLong(), Timeline.minObjectId()];
+		const accountMaxArgs = () => [Timeline.maxLong(), Timeline.maxLong(), Timeline.maxObjectId()];
+		const accountImportanceToArgs = (account) => [account.account.importance, account.account.publicKeyHeight, account._id];
+		this.accountByImportanceTimeline = new Timeline({
+			database: this,
+			...Timeline.generateAbsoluteParameters({
+				baseMethodName: 'accountsByImportance',
+				generateMinArgs: accountMinArgs,
+				generateMaxArgs: accountMaxArgs
+			}),
+			...Timeline.generateIdParameters({
+				keyName: 'Address',
+				baseMethodName: 'accountsByImportance',
+				idMethodName: 'rawAccountWithImportanceByAddress',
+				generateArgs: accountImportanceToArgs
+			}),
+			...Timeline.generateIdParameters({
+				keyName: 'PublicKey',
+				baseMethodName: 'accountsByImportance',
+				idMethodName: 'rawAccountWithImportanceByPublicKey',
+				generateArgs: accountImportanceToArgs
+			})
+		});
+
+		// Accounts by harvested blocks timeline.
+		const accountHarvestedBlocksToArgs = (account) => [account.account.harvestedBlocks, account.account.publicKeyHeight, account._id];
+		this.accountByHarvestedBlocksTimeline = new Timeline({
+			database: this,
+			...Timeline.generateAbsoluteParameters({
+				baseMethodName: 'accountsByHarvestedBlocks',
+				generateMinArgs: accountMinArgs,
+				generateMaxArgs: accountMaxArgs
+			}),
+			...Timeline.generateIdParameters({
+				keyName: 'Address',
+				baseMethodName: 'accountsByHarvestedBlocks',
+				idMethodName: 'rawAccountWithHarvestedBlocksByAddress',
+				generateArgs: accountHarvestedBlocksToArgs
+			}),
+			...Timeline.generateIdParameters({
+				keyName: 'PublicKey',
+				baseMethodName: 'accountsByHarvestedBlocks',
+				idMethodName: 'rawAccountWithHarvestedBlocksByPublicKey',
+				generateArgs: accountHarvestedBlocksToArgs
+			})
+		});
+
+		// Accounts by harvested fees timeline.
+		const accountHarvestedFeesToArgs = (account) => [account.account.harvestedFees, account.account.publicKeyHeight, account._id];
+		this.accountByHarvestedFeesTimeline = new Timeline({
+			database: this,
+			...Timeline.generateAbsoluteParameters({
+				baseMethodName: 'accountsByHarvestedFees',
+				generateMinArgs: accountMinArgs,
+				generateMaxArgs: accountMaxArgs
+			}),
+			...Timeline.generateIdParameters({
+				keyName: 'Address',
+				baseMethodName: 'accountsByHarvestedFees',
+				idMethodName: 'rawAccountWithHarvestedFeesByAddress',
+				generateArgs: accountHarvestedFeesToArgs
+			}),
+			...Timeline.generateIdParameters({
+				keyName: 'PublicKey',
+				baseMethodName: 'accountsByHarvestedFees',
+				idMethodName: 'rawAccountWithHarvestedFeesByPublicKey',
+				generateArgs: accountHarvestedFeesToArgs
+			})
+		});
 	}
 
 	connect(url, dbName) {
@@ -492,6 +652,131 @@ class CatapultDb {
 			.then(this.sanitizer.deleteIds);
 	}
 
+	// region account transactions
+
+	/**
+	 * Retrieves confirmed transactions for which an account is the sender or receiver.
+	 * An account is sender or receiver if its address is in the transaction meta addresses.
+	 * @param {Uint8Array} accountAddress Account address who sends or receives the transactions.
+	 * @param {uintArray} transactionTypes Transaction types to filter by.
+	 * @param {string} id Paging id.
+	 * @param {int} pageSize Page size.
+	 * @param {object} ordering Page ordering.
+	 * @returns {Promise.<array>} Confirmed transactions.
+	 */
+	accountTransactionsConfirmed(accountAddress, transactionTypes, id, pageSize, ordering) {
+		const conditions = undefined !== transactionTypes
+			? createMetaAddressesAndTypeConditions(accountAddress, transactionTypes)
+			: createMetaAddressesConditions(accountAddress);
+		return this.queryTransactions(conditions, id, pageSize, { sortOrder: ordering });
+	}
+
+	// endregion
+	// region transaction retrieval for account
+
+	/**
+	 * Retrieves confirmed incoming transactions for which an account is the receiver.
+	 * @param {Uint8Array} accountAddress Account address who receives the transactions.
+	 * @param {uintArray} transactionTypes Transaction types to filter by.
+	 * @param {string} id Paging id.
+	 * @param {int} pageSize Page size.
+	 * @param {object} ordering Page ordering.
+	 * @returns {Promise.<array>} Confirmed transactions.
+	 */
+	accountTransactionsIncoming(accountAddress, transactionTypes, id, pageSize, ordering) {
+		const bufferAddress = Buffer.from(accountAddress);
+
+		const getInnerTransactionConditions = () => {
+			const conditions = {
+				$and: [
+					{ 'meta.aggregateId': { $exists: true } },
+					{ 'transaction.recipientAddress': bufferAddress }
+				]
+			};
+
+			if (undefined !== transactionTypes)
+				conditions.$and.push({ 'transaction.type': { $in: transactionTypes } });
+
+			return conditions;
+		};
+
+		// Search for inner transactions by recipient address
+		return this.database.collection('transactions')
+			.find(getInnerTransactionConditions())
+			.project({ 'meta.aggregateId': 1 })
+			.toArray()
+			.then(transactions => transactions.map(transaction => transaction.meta.aggregateId))
+			.then(transactionIds => {
+				const baseCondition = {
+					$or: [
+						{ 'transaction.recipientAddress': bufferAddress },
+						{ id: { $in: transactionIds } }
+					]
+				};
+
+				const conditions = undefined !== transactionTypes
+					? { $and: [{ 'transaction.type': { $in: transactionTypes } }, baseCondition] }
+					: baseCondition;
+
+				return this.queryTransactions(conditions, id, pageSize, { sortOrder: ordering });
+			});
+	}
+
+	/**
+	 * Retrieves confirmed outgoing transactions for which an account is the sender.
+	 * @param {Uint8Array} publicKey Public key of the account who sends the transactions.
+	 * @param {uintArray} transactionTypes Transaction types to filter by.
+	 * @param {string} id Paging id.
+	 * @param {int} pageSize Page size.
+	 * @param {object} ordering Page ordering.
+	 * @returns {Promise.<array>} Confirmed transactions.
+	 */
+	accountTransactionsOutgoing(publicKey, transactionTypes, id, pageSize, ordering) {
+		const bufferPublicKey = Buffer.from(publicKey);
+		const conditions = undefined !== transactionTypes
+			? { $and: [{ 'transaction.signerPublicKey': bufferPublicKey }, { 'transaction.type': { $in: transactionTypes } }] }
+			: { 'transaction.signerPublicKey': bufferPublicKey };
+
+		return this.queryTransactions(conditions, id, pageSize, { sortOrder: ordering });
+	}
+
+	/**
+	 * Retrieves unconfirmed transactions for which an account is the sender or receiver.
+	 * An account is sender or receiver if its address is in the unconfirmed transaction meta addresses.
+	 * @param {Uint8Array} accountAddress Account address who sends or receives the unconfirmed transactions.
+	 * @param {uint} transactionTypes Transaction types to filter by.
+	 * @param {string} id Paging id.
+	 * @param {int} pageSize Page size.
+	 * @param {object} ordering Page ordering.
+	 * @returns {Promise.<array>} Unconfirmed transactions.
+	 */
+	accountTransactionsUnconfirmed(accountAddress, transactionTypes, id, pageSize, ordering) {
+		const conditions = undefined !== transactionTypes
+			? createMetaAddressesAndTypeConditions(accountAddress, transactionTypes)
+			: createMetaAddressesConditions(accountAddress);
+
+		return this.queryTransactions(conditions, id, pageSize, { collectionName: 'unconfirmedTransactions', sortOrder: ordering });
+	}
+
+	/**
+	 * Retrieves partial transactions for which an account is the sender or receiver.
+	 * An account is sender or receiver if its address is in the partial transaction meta addresses.
+	 * @param {Uint8Array} accountAddress Account address who sends or receives the partial transactions.
+	 * @param {uintArray} transactionTypes Transaction types to filter by.
+	 * @param {string} id Paging id.
+	 * @param {int} pageSize Page size.
+	 * @param {object} ordering Page ordering.
+	 * @returns {Promise.<array>} Partial transactions.
+	 */
+	accountTransactionsPartial(accountAddress, transactionTypes, id, pageSize, ordering) {
+		const conditions = undefined !== transactionTypes
+			? createMetaAddressesAndTypeConditions(accountAddress, transactionTypes)
+			: createMetaAddressesConditions(accountAddress);
+
+		return this.queryTransactions(conditions, id, pageSize, { collectionName: 'partialTransactions', sortOrder: ordering });
+	}
+
+	// endregion
 	// region account retrieval
 
 	accountsByIds(ids) {
@@ -513,6 +798,269 @@ class CatapultDb {
 				delete account.importances;
 				return accountWithMetadata;
 			}));
+	}
+
+	// endregion
+
+	// region cursor account helpers
+
+	// Helper methods to add importance field.
+	addFieldImportance() {
+		return addFieldImportanceImpl('value');
+	}
+
+	// Helper methods to add importanceHeight field.
+	addFieldImportanceHeight() {
+		return addFieldImportanceImpl('height');
+	}
+
+	// Helper methods to add the harvestedBlocks field.
+	addFieldHarvestedBlocks() {
+		return { $size: "$account.activityBuckets" };
+	}
+
+	// Helper methods to add the harvestedFees field.
+	addFieldHarvestedFees() {
+		// Sum reduce over `totalFeesPaid` in `account.activityBuckets`.
+		return {
+			$reduce: {
+				input: "$account.activityBuckets",
+				initialValue: { $toLong: 0 },
+				in: { $add: ["$$value", "$$this.totalFeesPaid"] }
+ 			}
+		};
+	}
+
+	// Retrieve account by address with custom fields added and projected.
+	rawAccountByAddress(collectionName, address, addFields, projection) {
+		const aggregation = [
+			{ $match: { 'account.address': { $eq: Buffer.from(address) } } },
+			addFields
+		];
+		return this.database.collection(collectionName)
+			.aggregate(aggregation, { promoteLongs: false })
+			.project(projection)
+			.limit(1)
+			.toArray()
+			.then(accounts => Promise.resolve(accounts[0]));
+	}
+
+	// Since the public key isn't unique for the network's private key,
+	// and the calculation doesn't generate the right address,
+	// this may not work for all data, but it's accurate for everything else.
+	publicKeyToAddress(publicKey) {
+		return address.publicKeyToAddress(publicKey, this.networkId);
+	}
+
+	// endregion
+
+	// region cursor account by importance retrieval
+
+	rawAccountWithImportanceByAddress(collectionName, address) {
+		const addFields = { $addFields: {
+			'account.importance': this.addFieldImportance(),
+			'account.importanceHeight': this.addFieldImportanceHeight()
+		} };
+		const projection = { 'account.importances': 0 };
+		return this.rawAccountByAddress(collectionName, address, addFields, projection);
+	}
+
+	rawAccountWithImportanceByPublicKey(collectionName, publicKey) {
+		const address = this.publicKeyToAddress(publicKey);
+		return this.rawAccountWithImportanceByAddress(collectionName, address);
+	}
+
+	// Internal method to find sorted accounts by importance from query.
+	// Note:
+	//	Use an initial sort to ensure we limit in the desired order,
+	//	then use a final sort to ensure everything is in descending order.
+	sortedAccountsByImportance(collectionName, match, sortAscending, count) {
+		const aggregation = [
+			{ $addFields: {
+				'account.importance': this.addFieldImportance(),
+				'account.importanceHeight': this.addFieldImportanceHeight()
+			} },
+			{ $match: match }
+		];
+		// Need secondary public key height and ID height to sort by when the
+		// account's public key was known to network.
+		const projection = { 'account.importances': 0 };
+		const order = sortAscending ? 1 : -1;
+		const initialSort = { 'account.importance': order, 'account.publicKeyHeight': order, _id: order };
+		const finalSort = { 'account.importance': -1, 'account.publicKeyHeight': -1, _id: -1 };
+
+		return this.database.collection(collectionName)
+			.aggregate(aggregation, { promoteLongs: false })
+			.sort(initialSort)
+			.limit(count)
+			.sort(finalSort)
+			.project(projection)
+			.toArray()
+			.then(this.sanitizer.deleteIds);
+	}
+
+	// Generate an account match condition from a field, an ordering,
+	// and the publicKeyHeight and the object ID.
+	accountMatchCondition(field, ordering, value, height, id) {
+		// Match if the account field is less than the provided field
+		// If the fields are equal, match if the height is less than the
+		// public key height. If equal, match if the ID is less than the provided ID.
+		return { $or: [
+			{ [`account.${field}`]: { [ordering]: value } },
+			{ $and: [
+				{ [`account.${field}`]: { $eq: value } },
+				{ $or: [
+					{ 'meta.publicKeyHeight': { $eq: height }, _id: { [ordering]: id } },
+					{ 'meta.publicKeyHeight': { [ordering]: height } }
+				]},
+			]},
+		]};
+	}
+
+	// Internal method: get accounts up to (non-inclusive) the account with importance, height,
+	// and ID, returning at max `numAccounts` items.
+	accountsByImportanceFrom(collectionName, importance, height, id, numAccounts) {
+		const match = this.accountMatchCondition('importance', '$lt', importance, height, id);
+		return this.sortedAccountsByImportance(collectionName, match, false, numAccounts)
+			.then(accounts => Promise.resolve(accounts));
+	}
+
+	// Internal method: get accounts since (non-inclusive) the account with importance, height,
+	// and ID, returning at max `numAccounts` items.
+	accountsByImportanceSince(collectionName, importance, height, id, numAccounts) {
+		const match = this.accountMatchCondition('importance', '$gt', importance, height, id);
+		return this.sortedAccountsByImportance(collectionName, match, true, numAccounts)
+			.then(accounts => Promise.resolve(accounts));
+	}
+
+	// endregion
+
+	// region cursor account by harvested blocks retrieval
+
+	rawAccountWithHarvestedBlocksByAddress(collectionName, address) {
+		const addFields = { $addFields: {
+			'account.importance': this.addFieldImportance(),
+			'account.importanceHeight': this.addFieldImportanceHeight(),
+			'account.harvestedBlocks': this.addFieldHarvestedBlocks()
+		} };
+		const projection = { 'account.importances': 0 };
+		return this.rawAccountByAddress(collectionName, address, addFields, projection);
+	}
+
+	rawAccountWithHarvestedBlocksByPublicKey(collectionName, publicKey) {
+		const address = this.publicKeyToAddress(publicKey);
+		return this.rawAccountWithHarvestedBlocksByAddress(collectionName, address);
+	}
+
+	// Internal method to find sorted accounts by harvested blocks from query.
+	// Note:
+	//	Use an initial sort to ensure we limit in the desired order,
+	//	then use a final sort to ensure everything is in descending order.
+	sortedAccountsByHarvestedBlocks(collectionName, match, sortAscending, count) {
+		const aggregation = [
+			{ $addFields: {
+				'account.importance': this.addFieldImportance(),
+				'account.importanceHeight': this.addFieldImportanceHeight(),
+				'account.harvestedBlocks': this.addFieldHarvestedBlocks()
+			} },
+			{ $match: match }
+		];
+		// Need secondary public key height and ID height to sort by when the
+		// account's public key was known to network.
+		const projection = { 'account.importances': 0, 'account.harvestedBlocks': 0 };
+		const order = sortAscending ? 1 : -1;
+		const initialSort = { 'account.harvestedBlocks': order , 'account.publicKeyHeight': order , _id: order  };
+		const finalSort = { 'account.harvestedBlocks': -1, 'account.publicKeyHeight': -1, _id: -1 };
+
+		return this.database.collection(collectionName)
+			.aggregate(aggregation, { promoteLongs: false })
+			.sort(initialSort)
+			.limit(count)
+			.sort(finalSort)
+			.project(projection)
+			.toArray()
+			.then(this.sanitizer.deleteIds);
+	}
+
+	// Internal method: get accounts up to (non-inclusive), returning at max `numAccounts` items.
+	accountsByHarvestedBlocksFrom(collectionName, harvestedBlocks, height, id, numAccounts) {
+		const match = this.accountMatchCondition('harvestedBlocks', '$lt', harvestedBlocks, height, id);
+		return this.sortedAccountsByHarvestedBlocks(collectionName, match, false, numAccounts)
+			.then(accounts => Promise.resolve(accounts));
+	}
+
+	// Internal method: get accounts since (non-inclusive), returning at max `numAccounts` items.
+	accountsByHarvestedBlocksSince(collectionName, harvestedBlocks, height, id, numAccounts) {
+		const match = this.accountMatchCondition('harvestedBlocks', '$gt', harvestedBlocks, height, id);
+		return this.sortedAccountsByHarvestedBlocks(collectionName, match, true, numAccounts)
+			.then(accounts => Promise.resolve(accounts));
+	}
+
+	// endregion
+
+	// region cursor account by harvested fees retrieval
+
+	rawAccountWithHarvestedFeesByAddress(collectionName, address) {
+		const addFields = { $addFields: {
+			'account.importance': this.addFieldImportance(),
+			'account.importanceHeight': this.addFieldImportanceHeight(),
+			'account.harvestedBlocks': this.addFieldHarvestedBlocks(),
+			'account.harvestedFees': this.addFieldHarvestedFees()
+		} };
+		const projection = { 'account.importances': 0, 'account.harvestedBlocks': 0 };
+		return this.rawAccountByAddress(collectionName, address, addFields, projection);
+	}
+
+	rawAccountWithHarvestedFeesByPublicKey(collectionName, publicKey) {
+		const address = this.publicKeyToAddress(publicKey);
+		return this.rawAccountWithHarvestedFeesByAddress(collectionName, address);
+	}
+
+	// Internal method to find sorted accounts by harvested fees from query.
+	// Note:
+	//	Use an initial sort to ensure we limit in the desired order,
+	//	then use a final sort to ensure everything is in descending order.
+	sortedAccountsByHarvestedFees(collectionName, match, sortAscending, count) {
+		const aggregation = [
+			{ $addFields: {
+				'account.importance': this.addFieldImportance(),
+				'account.importanceHeight': this.addFieldImportanceHeight(),
+				'account.harvestedBlocks': this.addFieldHarvestedBlocks(),
+				'account.harvestedFees': this.addFieldHarvestedFees()
+			} },
+			{ $match: match }
+		];
+		// Sort by harvested blocks after to break ties: more attempted harvested,
+		// should score higher.
+		// Need secondary public key height and ID height to sort by when the
+		// account's public key was known to network.
+		const projection = { 'account.importances': 0, 'account.harvestedBlocks': 0, 'account.harvestedFees': 0 };
+		const order = sortAscending ? 1 : -1;
+		const initialSort = { 'account.harvestedFees': order, 'account.harvestedBlocks': order, 'account.publicKeyHeight': order, _id: order };
+		const finalSort = { 'account.harvestedFees': -1, 'account.harvestedBlocks': -1, 'account.publicKeyHeight': -1, _id: -1 };
+
+		return this.database.collection(collectionName)
+			.aggregate(aggregation, { promoteLongs: false })
+			.sort(initialSort)
+			.limit(count)
+			.sort(finalSort)
+			.project(projection)
+			.toArray()
+			.then(this.sanitizer.deleteIds);
+	}
+
+	// Internal method: get accounts up to (non-inclusive), returning at max `numAccounts` items.
+	accountsByHarvestedFeesFrom(collectionName, harvestedFees, height, id, numAccounts) {
+		const match = this.accountMatchCondition('harvestedFees', '$lt', harvestedFees, height, id);
+		return this.sortedAccountsByHarvestedFees(collectionName, match, false, numAccounts)
+			.then(accounts => Promise.resolve(accounts));
+	}
+
+	// Internal method: get accounts since (non-inclusive), returning at max `numAccounts` items.
+	accountsByHarvestedFeesSince(collectionName, harvestedFees, height, id, numAccounts) {
+		const match = this.accountMatchCondition('harvestedFees', '$gt', harvestedFees, height, id);
+		return this.sortedAccountsByHarvestedFees(collectionName, match, true, numAccounts)
+			.then(accounts => Promise.resolve(accounts));
 	}
 
 	// endregion
